@@ -74,5 +74,6 @@ app.get("/videos", async (req, res) => {
 
 const port = process.env.PORT || 3000;
 app.use("/videos", express.static(path.join(__dirname, "videos")));
+app.use("/thumbnails", express.static(path.join(__dirname, "thumbnails")));
 app.get("/", (req, res) => res.send("Hello World!"));
 app.listen(port, () => console.log("Server running on " + port));
