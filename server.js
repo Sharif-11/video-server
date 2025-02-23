@@ -12,6 +12,7 @@ const path = require("path");
 const multer = require("multer");
 const fs = require("fs");
 const sizeOf = require("image-size");
+
 app.use(express.json());
 app.use(
   cors({
@@ -317,8 +318,7 @@ app.get("/image-to-video", exportUpload.single("image"), (req, res) => {
   width = width % 2 === 0 ? width : width + 1;
   height = height % 2 === 0 ? height : height + 1;
   const resolution = `${width}x${height}`;
-
-  console.log("width", width, "height", height, "duration", duration);
+  const time = new Date().getTime();
 
   ffmpeg()
     .input(imagePath)
@@ -330,9 +330,14 @@ app.get("/image-to-video", exportUpload.single("image"), (req, res) => {
     .outputOptions("-t " + duration)
     .outputOptions("-preset medium")
     .outputOptions("-crf 18")
-    .on("start", (command) => console.log("FFmpeg command:", command))
+    .on("start", (command) => console.clear())
     .on("end", () => {
       console.log("Video generated successfully.");
+      console.log(
+        "Total time taken:",
+        (new Date().getTime() - time) / 1000,
+        "Seconds"
+      );
       res.download(outputVideoPath, "output.mp4");
     })
     .on("error", (err) => {
@@ -342,19 +347,16 @@ app.get("/image-to-video", exportUpload.single("image"), (req, res) => {
     .save(outputVideoPath);
 });
 app.post("/overlay-image", (req, res) => {
-  const videoPath = path.join(__dirname, "exports", "base_drawing.mp4");
-  const imagePath = path.join(__dirname, "exports", "circle.png");
-  const outputVideoPath = path.join(
-    path.dirname(videoPath),
-    `base_drawing_shape.mp4`
-  );
+  const videoPath = path.join(__dirname, "exports", "output.mp4");
+  const imagePath = path.join(__dirname, "exports", "text.png");
+  const outputVideoPath = path.join(path.dirname(videoPath), `output-2.mp4`);
 
   // Parameters
   const startTime = parseFloat(req.body.startTime) || 0; // Start time in seconds
   const endTime = parseFloat(req.body.endTime) || 10; // End time in seconds
   const x = req.body.x || 0; // X position of the overlay
   const y = req.body.y || 0; // Y position of the overlay
-
+  const time = new Date().getTime();
   ffmpeg(videoPath)
     .input(imagePath)
     .complexFilter([
@@ -365,6 +367,11 @@ app.post("/overlay-image", (req, res) => {
     .on("start", (command) => console.log("FFmpeg command:", command))
     .on("end", () => {
       console.log("Overlay added successfully.");
+      console.log(
+        "Total time taken:",
+        (new Date().getTime() - time) / 1000,
+        "Seconds"
+      );
       res.download(outputVideoPath, "output.mp4", (err) => {
         if (err) console.error("Error sending file:", err);
         // Clean up files (optional)
@@ -379,95 +386,134 @@ app.post("/overlay-image", (req, res) => {
     })
     .save(outputVideoPath);
 });
-app.get("/overlay-video", (req, res) => {
-  const video1Path = path.join(__dirname, "videos", "video_01.mp4"); // Base video
-  const video2Path = path.join(__dirname, "videos", "video_02.mp4"); // Overlay video
-  const outputVideoPath = path.join(__dirname, "videos", "output.mp4"); // Output video
+app.get("/overlay-video", async (req, res) => {
+  const video1Path = path.join(__dirname, "exports", "output-2.mp4"); // Base video
+  const video2Path = path.join(__dirname, "videos", "video_01.mp4"); // Overlay video
+  const outputVideoPath = path.join(__dirname, "exports", "output.mp4"); // Output video
+  console.clear();
 
-  // Extract parameters from the request body
-  const { x = 100, y = 100, width = 450, height = 450, start, end } = req.body;
+  const hasAudio = (videoPath) => {
+    return new Promise((resolve, reject) => {
+      ffmpeg.ffprobe(videoPath, (err, metadata) => {
+        if (err) {
+          reject(err);
+        } else {
+          // Find duration and audio stream
+          const duration = metadata.format.duration;
+          const audio = metadata.streams.some(
+            (stream) => stream.codec_type === "audio"
+          );
+          resolve({ audio, duration });
+        }
+      });
+    });
+  };
 
-  // Check if the overlay video exists
+  if (!fs.existsSync(video1Path)) {
+    return res
+      .status(404)
+      .send("Base video not found in the specified folder.");
+  }
   if (!fs.existsSync(video2Path)) {
     return res
       .status(404)
       .send("Overlay video not found in the specified folder.");
   }
 
-  // Validate width and height
-  if (!width || !height) {
-    return res
-      .status(400)
-      .send("Width and height for the overlay video are required.");
+  const { x, y, width, height, overlayStartTime } = req.body;
+
+  const [
+    { audio: video1HasAudio, duration: baseDuration },
+    { audio: video2HasAudio, duration: overlayDuration },
+  ] = await Promise.all([hasAudio(video1Path), hasAudio(video2Path)]);
+
+  console.log({
+    video1HasAudio,
+    video2HasAudio,
+    baseDuration,
+    overlayDuration,
+  });
+
+  // Overlay starts at the specified start time
+
+  const complexFilter = [
+    // Resize and reset the overlay video's presentation timestamp
+    `[1:v] scale=${width}:${height}, setpts=PTS-STARTPTS [overlay]; ` +
+      // Delay the overlay video to start at the specified start time
+      `[overlay] tpad=start_duration=${overlayStartTime} [overlay_delayed]; ` +
+      // Overlay the video at the specified position and time
+      `[0:v][overlay_delayed] overlay=${x}:${y}:enable='between(t,${overlayStartTime},${
+        overlayStartTime + overlayDuration
+      })' [outv]`,
+  ];
+
+  let audioFilter = "";
+  if (video1HasAudio && video2HasAudio) {
+    // Both videos have audio
+    audioFilter =
+      `[1:a] atrim=start=0:end=${overlayDuration}, asetpts=PTS-STARTPTS, volume=1 [overlay_audio]; ` +
+      `[overlay_audio] adelay=${overlayStartTime * 1000}|${
+        overlayStartTime * 1000
+      } [overlay_audio_delayed]; ` +
+      `[0:a][overlay_audio_delayed] amix=inputs=2:duration=longest [outa]`;
+  } else if (video1HasAudio) {
+    // Only base video has audio
+    audioFilter = `[0:a] asetpts=PTS-STARTPTS [outa]`;
+  } else if (video2HasAudio) {
+    // Only overlay video has audio
+    audioFilter =
+      `[1:a] atrim=start=0:end=${overlayDuration}, asetpts=PTS-STARTPTS, volume=1 [overlay_audio]; ` +
+      `[overlay_audio] adelay=${overlayStartTime * 1000}|${
+        overlayStartTime * 1000
+      } [outa]`;
+  } else {
+    // No audio streams
+    audioFilter = "";
   }
 
-  // Start time for processing
+  if (audioFilter) {
+    complexFilter.push(audioFilter);
+  }
+
+  console.log(complexFilter);
+
   const startTime = new Date().getTime();
 
-  // Get the duration of the overlay video
-  ffmpeg.ffprobe(video2Path, (err, metadata) => {
-    if (err) {
-      console.error("Error getting overlay video metadata:", err.message);
-      return res.status(500).send("Error getting overlay video metadata");
-    }
+  const outputOptions = [
+    "-map [outv]", // Use the output video stream from the filter
+    "-c:v libx264", // Use H.264 encoding for video
+    "-preset medium", // Better quality encoding
+    "-crf 18", // Lower CRF for better quality
+    "-pix_fmt yuv420p", // Ensure compatibility
+  ];
 
-    const overlayDuration = metadata.format.duration; // Duration of the overlay video
-    const overlayStartTime = start || 0; // Overlay starts at the specified start time
-    const overlayEndTime = end || overlayDuration; // Overlay ends at the specified end time
+  // Add audio mapping and encoding only if at least one video has audio
+  if (video1HasAudio || video2HasAudio) {
+    outputOptions.push("-map [outa]", "-c:a aac"); // Use AAC encoding for audio
+  }
 
-    // Ensure the overlay video duration does not exceed the specified end time
-    const actualOverlayDuration = Math.min(
-      overlayDuration,
-      overlayEndTime - overlayStartTime
-    );
-
-    // Simplified overlay logic with revised positioning, resizing, and audio timing
-    ffmpeg()
-      .input(video1Path) // Base video
-      .input(video2Path) // Overlay video
-      .complexFilter([
-        // Resize and reset the overlay video's presentation timestamp
-        `[1:v] scale=${width}:${height}, setpts=PTS-STARTPTS [overlay]; ` +
-          // Delay the overlay video to start at the specified start time
-          `[overlay] tpad=start_duration=${overlayStartTime} [overlay_delayed]; ` +
-          // Overlay the video at the specified position and time
-          `[0:v][overlay_delayed] overlay=${x}:${y}:enable='between(t,${overlayStartTime},${overlayEndTime})' [outv]; ` +
-          // Trim and sync the overlay video's audio to start from the beginning
-          `[1:a] atrim=start=0:end=${actualOverlayDuration}, asetpts=PTS-STARTPTS, volume=1 [overlay_audio]; ` +
-          // Delay the overlay audio to start at the specified start time
-          `[overlay_audio] adelay=${overlayStartTime * 1000}|${
-            overlayStartTime * 1000
-          } [overlay_audio_delayed]; ` +
-          // Mix the base and overlay audio
-          `[0:a][overlay_audio_delayed] amix=inputs=2:duration=longest [outa]`,
-      ])
-      .outputOptions([
-        "-map [outv]", // Use the output video stream from the filter
-        "-map [outa]", // Use the mixed audio stream from the filter
-        "-c:v libx264", // Use H.264 encoding for video
-        "-preset medium", // Better quality encoding
-        "-crf 18", // Lower CRF for better quality
-        "-pix_fmt yuv420p", // Ensure compatibility
-        "-c:a aac", // Use AAC encoding for audio
-      ])
-      .output(outputVideoPath)
-      .on("start", (command) => {
-        console.log("FFmpeg command:", command);
-      })
-      .on("end", () => {
-        // Calculate processing time
-        const endTime = new Date().getTime();
-        const processingTime = (endTime - startTime) / 1000; // Convert to seconds
-        console.log("Video overlayed successfully.");
-        console.log(`Processing time: ${processingTime} seconds`);
-        res.download(outputVideoPath, "output.mp4");
-      })
-      .on("error", (err) => {
-        console.error("Error overlaying video:", err.message);
-        res.status(500).send("Error overlaying video");
-      })
-      .run();
-  });
+  ffmpeg()
+    .input(video1Path) // Base video
+    .input(video2Path) // Overlay video
+    .complexFilter(complexFilter)
+    .outputOptions(outputOptions)
+    .output(outputVideoPath)
+    .on("start", (command) => {
+      console.log("FFmpeg command:", command);
+    })
+    .on("end", () => {
+      // Calculate processing time
+      const endTime = new Date().getTime();
+      const processingTime = (endTime - startTime) / 1000; // Convert to seconds
+      console.log("Video overlayed successfully.");
+      console.log(`Processing time: ${processingTime} seconds`);
+      res.download(outputVideoPath, "output.mp4");
+    })
+    .on("error", (err) => {
+      console.error("Error overlaying video:", err.message);
+      res.status(500).send("Error overlaying video");
+    })
+    .run();
 });
 
 app.get("/generate-video", (req, res) => {
